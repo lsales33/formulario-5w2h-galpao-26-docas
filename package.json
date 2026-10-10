@@ -1,0 +1,9 @@
+{
+  "name": "roteirizador-ab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Roteirizador origem-destino com API própria (OSM ou Google Maps Platform)",
+  "main": "server.js",
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node server.js", "test": "node test.js" }
+}

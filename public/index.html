@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Roteirizador A→B</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+/* Layout: painel de comando à esquerda (pilha em celular) + mapa ocupando o resto; o resultado aparece como uma placa verde de rodovia */
+:root{
+  --bg:#eef1f0; --panel:#fbfcfb; --fg:#17201c; --muted:#5b6862; --line:#d5dcd8;
+  --field:#ffffff; --sign:#0b6b3a; --sign-ink:#ffffff; --accent:#0b6b3a;
+  --warn:#f2c230; --warn-ink:#1b1b1b; --alt:#7f8f88; --danger:#b4231f;
+  --hover:#e6ece9; --tile-filter:none;
+  --f-display:"Barlow Condensed","Arial Narrow",system-ui,sans-serif;
+  --f-body:"Barlow",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --f-mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0f1513; --panel:#141c19; --fg:#e4ebe7; --muted:#93a29b; --line:#27322d;
+  --field:#1a2420; --sign:#0f7a43; --sign-ink:#ffffff; --accent:#3fbf7a;
+  --warn:#f2c230; --warn-ink:#1b1b1b; --alt:#6f7f78; --danger:#ef6b63;
+  --hover:#1f2a26; --tile-filter:invert(1) hue-rotate(180deg) brightness(.92) contrast(.88) saturate(.6);
+  color-scheme:dark;
+}}
+:root[data-theme="dark"]{
+  --bg:#0f1513; --panel:#141c19; --fg:#e4ebe7; --muted:#93a29b; --line:#27322d;
+  --field:#1a2420; --sign:#0f7a43; --sign-ink:#ffffff; --accent:#3fbf7a;
+  --warn:#f2c230; --warn-ink:#1b1b1b; --alt:#6f7f78; --danger:#ef6b63;
+  --hover:#1f2a26; --tile-filter:invert(1) hue-rotate(180deg) brightness(.92) contrast(.88) saturate(.6);
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:15px/1.45 var(--f-body);display:grid;grid-template-columns:minmax(340px,410px) 1fr}
+#panel{background:var(--panel);border-right:1px solid var(--line);overflow-y:auto;padding-block:20px 28px;padding-inline:20px;display:flex;flex-direction:column;gap:18px;min-width:0}
+#panel>*{flex-shrink:0}
+#map{height:100%;min-height:0}
+.leaflet-tile-pane{filter:var(--tile-filter)}
+header h1{font:700 1.75rem/1 var(--f-display);letter-spacing:.01em;margin:0;text-transform:uppercase}
+header p{margin:4px 0 0;color:var(--muted);font-size:.86rem}
+
+.modes{display:grid;grid-template-columns:repeat(3,1fr);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.modes button{font:600 .82rem var(--f-body);padding:8px 4px;border:0;background:var(--field);color:var(--muted);cursor:pointer}
+.modes button+button{border-left:1px solid var(--line)}
+.modes button[aria-pressed="true"]{background:var(--accent);color:var(--panel)}
+
+.points{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center}
+.stack{display:flex;flex-direction:column;gap:8px;min-width:0}
+.field{position:relative}
+.field label{position:absolute;left:10px;top:50%;transform:translateY(-50%);width:22px;height:22px;border-radius:50%;display:grid;place-items:center;font:700 .78rem var(--f-display)}
+.field.a label{background:var(--sign);color:var(--sign-ink)}
+.field.b label{background:var(--warn);color:var(--warn-ink)}
+.field input{width:100%;font:500 .95rem var(--f-body);padding:11px 34px 11px 42px;border:1px solid var(--line);border-radius:8px;background:var(--field);color:var(--fg)}
+.field input:focus{outline:2px solid var(--accent);outline-offset:-1px}
+.field .clear{position:absolute;right:6px;top:50%;transform:translateY(-50%);border:0;background:none;color:var(--muted);cursor:pointer;font-size:1.1rem;padding:4px 6px}
+.swap{border:1px solid var(--line);background:var(--field);color:var(--fg);border-radius:8px;width:38px;height:38px;cursor:pointer;font-size:1.1rem}
+.swap:hover,.btn:hover{background:var(--hover)}
+.sugg{position:absolute;z-index:1000;left:0;right:0;top:calc(100% + 4px);background:var(--panel);border:1px solid var(--line);border-radius:8px;margin:0;padding:4px;list-style:none;box-shadow:0 8px 24px rgb(0 0 0 / .18);max-height:300px;overflow:auto}
+.sugg li{padding:8px 10px;border-radius:6px;cursor:pointer}
+.sugg li[aria-selected="true"],.sugg li:hover{background:var(--hover)}
+.sugg b{display:block;font-weight:600}
+.sugg small{color:var(--muted)}
+.hint{font-size:.8rem;color:var(--muted);margin:-8px 0 0}
+
+.status{font-size:.86rem;color:var(--muted);min-height:1.2em}
+.status.err{color:var(--danger)}
+.status:empty{display:none}
+
+/* placa de rodovia */
+.sign{background:var(--sign);color:var(--sign-ink);border-radius:10px;padding:14px 16px 12px;border:3px solid var(--sign);box-shadow:inset 0 0 0 2px var(--sign-ink)}
+.sign .to{font:600 .78rem var(--f-display);letter-spacing:.12em;text-transform:uppercase;opacity:.85}
+.sign .dest{font:700 1.5rem/1.05 var(--f-display);text-transform:uppercase;margin:2px 0 8px;overflow-wrap:anywhere}
+.sign .row{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;border-top:1px solid rgb(255 255 255 / .45);padding-top:8px}
+.sign .km{font:700 2.4rem/1 var(--f-display);font-variant-numeric:tabular-nums}
+.sign .km small{font-size:1.1rem;margin-left:3px}
+.sign .time{font:600 1.15rem var(--f-display);text-align:right}
+.sign .time span{display:block;font:500 .78rem var(--f-body);opacity:.85}
+.sign .via{font-size:.8rem;margin-top:6px;opacity:.9}
+
+.alts{display:flex;gap:6px;flex-wrap:wrap}
+.alts button{flex:1 1 30%;min-width:0;text-align:left;border:1px solid var(--line);background:var(--field);color:var(--fg);border-radius:8px;padding:8px 10px;cursor:pointer;font:inherit}
+.alts button[aria-pressed="true"]{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+.alts b{display:block;font:600 1rem var(--f-display);font-variant-numeric:tabular-nums}
+.alts small{color:var(--muted);font-size:.74rem;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+.section-label{font:600 .74rem var(--f-display);letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 8px}
+.cost{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.cost label{font-size:.78rem;color:var(--muted);display:flex;flex-direction:column;gap:3px}
+.cost input{font:500 .95rem var(--f-mono);padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--field);color:var(--fg);width:100%}
+.cost output{grid-column:1/-1;font:600 1.05rem var(--f-body);font-variant-numeric:tabular-nums}
+.cost output span{color:var(--muted);font-weight:400;font-size:.82rem}
+
+.actions{display:flex;gap:8px;flex-wrap:wrap}
+.btn{border:1px solid var(--line);background:var(--field);color:var(--fg);border-radius:8px;padding:8px 12px;font:600 .85rem var(--f-body);cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:6px}
+
+.steps{list-style:none;margin:0;padding:0;border-top:1px solid var(--line)}
+.steps li{display:grid;grid-template-columns:28px 1fr auto;gap:10px;align-items:start;padding:9px 4px;border-bottom:1px solid var(--line);cursor:pointer}
+.steps li:hover{background:var(--hover)}
+.steps svg{width:22px;height:22px;color:var(--accent)}
+.steps .t{font-weight:500}
+.steps .n{display:block;color:var(--muted);font-size:.82rem;overflow-wrap:anywhere}
+.steps .d{font:500 .8rem var(--f-mono);color:var(--muted);white-space:nowrap}
+.coords{font:400 .74rem var(--f-mono);color:var(--muted)}
+footer{font-size:.74rem;color:var(--muted);margin-top:auto}
+
+.pin{width:28px;height:28px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);display:grid;place-items:center;border:2px solid #fff;box-shadow:0 2px 6px rgb(0 0 0 / .4)}
+.pin span{transform:rotate(45deg);font:700 13px var(--f-display)}
+.pin.a{background:#0b6b3a;color:#fff}.pin.b{background:#f2c230;color:#1b1b1b}
+.popbtns{display:flex;gap:6px;margin-top:6px}
+.popbtns button{font:600 12px var(--f-body);padding:5px 8px;border-radius:6px;border:1px solid #ccd;cursor:pointer;background:#fff;color:#123}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+@media (max-width:760px){
+  body{display:flex;flex-direction:column;height:auto;min-height:100%}
+  #map{height:44vh;order:-1;flex:none}
+  #panel{border-right:0;border-top:1px solid var(--line);padding-inline:16px;overflow:visible}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<aside id="panel">
+  <header>
+    <h1>Roteirizador A→B</h1>
+    <p>Digite endereço ou CEP. Também dá para clicar no mapa ou arrastar os pinos.</p>
+  </header>
+
+  <div class="modes" role="group" aria-label="Meio de transporte">
+    <button id="m-car" data-mode="car" aria-pressed="true">Carro</button>
+    <button id="m-bike" data-mode="bike" aria-pressed="false">Bicicleta</button>
+    <button id="m-foot" data-mode="foot" aria-pressed="false">A pé</button>
+  </div>
+
+  <div class="points">
+    <div class="stack">
+      <div class="field a"><label for="in-a">A</label><input id="in-a" autocomplete="off" placeholder="Origem: endereço ou CEP" role="combobox" aria-expanded="false"><button class="clear" data-k="a" aria-label="Limpar origem">×</button></div>
+      <div class="field b"><label for="in-b">B</label><input id="in-b" autocomplete="off" placeholder="Destino: endereço ou CEP" role="combobox" aria-expanded="false"><button class="clear" data-k="b" aria-label="Limpar destino">×</button></div>
+    </div>
+    <button class="swap" id="swap" title="Inverter origem e destino" aria-label="Inverter origem e destino">⇅</button>
+  </div>
+  <p class="hint">Ex.: 01310-200 · Rua Barão de Jaguara, Campinas · Aeroporto de Viracopos</p>
+
+  <div class="status" id="status" role="status"></div>
+
+  <section id="result" hidden>
+    <div class="sign">
+      <div class="to">Destino</div>
+      <div class="dest" id="r-dest"></div>
+      <div class="row">
+        <div class="km" id="r-km"></div>
+        <div class="time"><span id="r-eta"></span><b id="r-time"></b></div>
+      </div>
+      <div class="via" id="r-via"></div>
+    </div>
+  </section>
+
+  <section id="alts-wrap" hidden>
+    <p class="section-label">Alternativas</p>
+    <div class="alts" id="alts"></div>
+  </section>
+
+  <section id="cost-wrap" hidden>
+    <p class="section-label">Custo de combustível</p>
+    <div class="cost">
+      <label for="c-cons">Consumo (km/l)<input id="c-cons" type="number" min="1" step="0.1" value="11"></label>
+      <label for="c-price">Preço (R$/litro)<input id="c-price" type="number" min="0" step="0.01" value="6.30"></label>
+      <output id="c-out"></output>
+    </div>
+  </section>
+
+  <section id="act-wrap" hidden>
+    <div class="actions">
+      <a class="btn" id="gmaps" target="_blank" rel="noopener">Abrir no Google Maps ↗</a>
+      <button class="btn" id="copy">Copiar resumo</button>
+    </div>
+  </section>
+
+  <section id="steps-wrap" hidden>
+    <p class="section-label">Passo a passo</p>
+    <ol class="steps" id="steps"></ol>
+  </section>
+
+  <footer id="foot">Mapa © colaboradores do OpenStreetMap · CEP: ViaCEP · Pedágios não incluídos.</footer>
+</aside>
+<div id="map" aria-label="Mapa"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
