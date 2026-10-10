@@ -1,5 +1,5 @@
 // Roteirizador A→B — servidor HTTP sem dependências (Node >= 18)
-// Provedor: OpenStreetMap por padrão; Google Maps Platform quando GOOGLE_MAPS_API_KEY estiver definida.
+// Endereços: OSM por padrão, Google com GOOGLE_MAPS_API_KEY. Rotas de caminhão: OpenRouteService com ORS_API_KEY; sem chave, OSRM com tempo ajustado.
 'use strict';
 const http = require('node:http');
 const fs = require('node:fs');
@@ -60,7 +60,8 @@ function fmtPhoton(f) {
   const title = p.name || street || p.city || 'Local';
   const sub = [p.name && street ? street : '', p.district || p.locality, p.city, p.state].filter((x, i, a) => x && a.indexOf(x) === i && x !== title).join(' · ');
   const label = [title, p.city && p.city !== title ? p.city : '', p.state ? uf(p.state) : ''].filter(Boolean).join(' – ');
-  return { lat, lng, title, sub, label };
+  const kind = p.type === 'house' || p.type === 'street' ? 'rua' : ['city','locality','district','county','state'].includes(p.type) ? 'cidade' : 'local';
+  return { lat, lng, title, sub, label, kind };
 }
 const osm = {
   async geocode(q, limit, bias) {
@@ -75,7 +76,7 @@ const osm = {
     const u = new URL('https://nominatim.openstreetmap.org/search');
     Object.entries({ format: 'jsonv2', q, limit, addressdetails: 1, 'accept-language': 'pt-BR', countrycodes: 'br' }).forEach(([k, v]) => u.searchParams.set(k, v));
     const j = await getJSON(u);
-    return j.map(r => { const parts = r.display_name.split(', '); return { lat: +r.lat, lng: +r.lon, title: parts.slice(0, 2).join(', '), sub: parts.slice(2, 5).join(' · '), label: parts.slice(0, 3).join(', ') }; });
+    return j.map(r => { const parts = r.display_name.split(', '); return { lat: +r.lat, lng: +r.lon, title: parts.slice(0, 2).join(', '), sub: parts.slice(2, 5).join(' · '), label: parts.slice(0, 3).join(', '), kind: ['road','house','building'].includes(r.addresstype) ? 'rua' : ['city','town','village','suburb','municipality','state'].includes(r.addresstype) ? 'cidade' : 'local' }; });
   },
   async reverse(lat, lng) {
     try {
@@ -95,7 +96,8 @@ function fmtGoogle(r) {
   const parts = r.formatted_address.split(', ');
   const title = street || parts[0];
   const sub = [c('sublocality').long_name || c('sublocality_level_1').long_name, city, st].filter(Boolean).join(' · ');
-  return { lat: r.geometry.location.lat, lng: r.geometry.location.lng, title, sub, label: [title, city && city !== title ? city + (st ? '/' + st : '') : ''].filter(Boolean).join(', ') };
+  return { lat: r.geometry.location.lat, lng: r.geometry.location.lng, title, sub, label: [title, city && city !== title ? city + (st ? '/' + st : '') : ''].filter(Boolean).join(', '),
+    kind: r.types.some(t => /route|street_address|premise/.test(t)) ? 'rua' : r.types.some(t => /locality|administrative_area|sublocality/.test(t)) ? 'cidade' : 'local' };
 }
 const google = {
   async geocode(q, limit) {
@@ -134,7 +136,7 @@ async function byCEP(raw) {
     const r = await geocodeAny(q, 1).catch(() => []);
     if (r.length) {
       const title = d.logradouro || d.bairro || d.localidade;
-      return [{ lat: r[0].lat, lng: r[0].lng, title, precision: q === queries[0] && d.logradouro ? 'rua' : 'aproximada',
+      return [{ lat: r[0].lat, lng: r[0].lng, title, kind: 'cep', cep: fmt, precision: q === queries[0] && d.logradouro ? 'rua' : 'aproximada',
         sub: `CEP ${fmt} · ${[d.bairro, d.localidade + '/' + d.uf].filter(Boolean).join(' · ')}`,
         label: `${title}, ${d.localidade}/${d.uf} (CEP ${fmt})` }];
     }
@@ -142,12 +144,38 @@ async function byCEP(raw) {
   throw new HttpError(404, 'CEP encontrado, mas sem coordenadas');
 }
 
-// ---------- rotas: OSRM ----------
-const OSRM = {
-  car: ['https://routing.openstreetmap.de/routed-car/route/v1/driving/', 'https://router.project-osrm.org/route/v1/driving/'],
-  bike: ['https://routing.openstreetmap.de/routed-bike/route/v1/driving/'],
-  foot: ['https://routing.openstreetmap.de/routed-foot/route/v1/driving/']
+// ---------- veículos ----------
+// Valores típicos de mercado (editáveis na tela). factor/cap ajustam o tempo quando a rota vem de um perfil de carro.
+const VEHICLES = {
+  van:     { name: 'Van',      h: 2.7, w: 2.0, l: 6.0,  t: 3.5, axles: 2, factor: 0.97, cap: 100, ors: 'delivery' },
+  toco:    { name: 'Toco',     h: 3.8, w: 2.6, l: 10.0, t: 16,  axles: 2, factor: 0.88, cap: 80,  ors: 'goods' },
+  truck:   { name: 'Caminhão', h: 4.2, w: 2.6, l: 14.0, t: 23,  axles: 3, factor: 0.85, cap: 80,  ors: 'hgv' },
+  carreta: { name: 'Carreta',  h: 4.4, w: 2.6, l: 18.6, t: 45,  axles: 5, factor: 0.80, cap: 80,  ors: 'hgv' }
 };
+const ORS_KEY = (process.env.ORS_API_KEY || '').trim();
+const ROUTING = ORS_KEY ? 'ors' : 'osm';
+function vehicleFrom(q) {
+  const id = VEHICLES[q.get('vehicle')] ? q.get('vehicle') : 'toco';
+  const d = VEHICLES[id];
+  const clamp = (k, min, max) => { const n = parseFloat(q.get(k)); return Number.isFinite(n) ? Math.min(Math.max(n, min), max) : null; };
+  return { id, ...d,
+    h: clamp('h', 1.5, 4.95) ?? d.h, l: clamp('l', 3, 30) ?? d.l, t: clamp('t', 1, 74) ?? d.t,
+    axles: Math.round(clamp('axles', 2, 9) ?? d.axles), avoidTolls: q.get('tolls') === 'avoid' };
+}
+function topRoads(steps) {
+  const by = new Map();
+  steps.forEach(s => { const n = (s.name || '').split(' · ')[0]; if (n) by.set(n, (by.get(n) || 0) + s.distance); });
+  return [...by.entries()].sort((a, b) => b[1] - a[1]).slice(0, 2).map(e => e[0]).join(', ');
+}
+function haversine(a, b) {
+  const R = 6371e3, r = x => x * Math.PI / 180;
+  const dLat = r(b.lat - a.lat), dLng = r(b.lng - a.lng);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(r(a.lat)) * Math.cos(r(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+// ---------- rotas: OSRM (perfil carro, tempo ajustado ao veículo) ----------
+const OSRM = ['https://routing.openstreetmap.de/routed-car/route/v1/driving/', 'https://router.project-osrm.org/route/v1/driving/'];
 const DIR = { uturn: 'Faça o retorno', 'sharp right': 'Vire acentuadamente à direita', right: 'Vire à direita', 'slight right': 'Mantenha-se à direita', straight: 'Siga em frente', 'slight left': 'Mantenha-se à esquerda', left: 'Vire à esquerda', 'sharp left': 'Vire acentuadamente à esquerda' };
 const ANG = { uturn: 180, 'sharp right': 135, right: 90, 'slight right': 45, straight: 0, 'slight left': -45, left: -90, 'sharp left': -135 };
 const SIDE = m => /right/.test(m || '') ? 'à direita' : /left/.test(m || '') ? 'à esquerda' : '';
@@ -177,76 +205,83 @@ function osrmKind(s) {
   if (m === 'uturn') return 'uturn';
   return 'turn';
 }
-async function osrmRoute(a, b, mode) {
+// tempo de cada trecho recalculado: velocidade do carro × fator do veículo, limitada à velocidade máxima do veículo
+function adjustedDuration(steps, v) {
+  return steps.reduce((sum, s) => {
+    if (!s.distance || !s.duration) return sum + (s.duration || 0);
+    const kmh = Math.min((s.distance / s.duration) * 3.6 * v.factor, v.cap);
+    return sum + s.distance / (kmh / 3.6);
+  }, 0);
+}
+async function osrmRoute(a, b, v) {
   let last;
-  for (const base of OSRM[mode]) {
-    try {
-      const j = await getJSON(`${base}${a.lng},${a.lat};${b.lng},${b.lat}?overview=full&geometries=geojson&steps=true&alternatives=true`, {}, 20000);
-      if (j.code !== 'Ok') { last = new HttpError(j.code === 'NoRoute' ? 404 : 502, j.code === 'NoRoute' ? 'Não existe rota viária entre esses pontos' : j.code); if (j.code === 'NoRoute') break; continue; }
-      return j.routes.slice(0, 3).map(r => {
-        const steps = [];
-        r.legs.flatMap(l => l.steps).forEach((s, i, all) => {
-          if (s.maneuver.type === 'new name' && all[i - 1] && all[i - 1].name === s.name) return;
-          steps.push({ text: osrmText(s), name: [s.name, s.ref && s.ref !== s.name ? s.ref : ''].filter(Boolean).join(' · '), distance: s.distance,
-            loc: [s.maneuver.location[1], s.maneuver.location[0]], kind: osrmKind(s), angle: ANG[s.maneuver.modifier] ?? 0 });
+  for (const base of OSRM) {
+    for (const exclude of v.avoidTolls ? [true, false] : [false]) {
+      try {
+        const j = await getJSON(`${base}${a.lng},${a.lat};${b.lng},${b.lat}?overview=full&geometries=geojson&steps=true&alternatives=true${exclude ? '&exclude=toll' : ''}`, {}, 20000)
+          .catch(e => { if (e.body && e.body.code) return e.body; throw e; });
+        if (j.code === 'NoRoute') throw new HttpError(404, 'Não existe rota viária entre esses pontos');
+        if (j.code !== 'Ok') { last = new HttpError(502, j.code); continue; }
+        const routes = j.routes.slice(0, 3).map(r => {
+          const raw = r.legs.flatMap(l => l.steps), steps = [];
+          raw.forEach((s, i) => {
+            if (s.maneuver.type === 'new name' && raw[i - 1] && raw[i - 1].name === s.name) return;
+            steps.push({ text: osrmText(s), name: [s.name, s.ref && s.ref !== s.name ? s.ref : ''].filter(Boolean).join(' · '), distance: s.distance,
+              loc: [s.maneuver.location[1], s.maneuver.location[0]], kind: osrmKind(s), angle: ANG[s.maneuver.modifier] ?? 0 });
+          });
+          return { distance: r.distance, duration: adjustedDuration(raw, v), summary: r.legs.map(l => l.summary).filter(Boolean).join(', ') || topRoads(steps),
+            coords: r.geometry.coordinates.map(([x, y]) => [+y.toFixed(5), +x.toFixed(5)]), steps };
         });
-        return { distance: r.distance, duration: r.duration, summary: r.legs.map(l => l.summary).filter(Boolean).join(', '),
-          coords: r.geometry.coordinates.map(([x, y]) => [+y.toFixed(5), +x.toFixed(5)]), steps };
-      });
-    } catch (e) { last = e; }
+        return { provider: 'osm', truckRules: false, tollsAvoided: exclude, routes };
+      } catch (e) { if (e.status === 404) throw e; last = e; }
+    }
   }
   throw last || new HttpError(502, 'Servidor de rotas indisponível');
 }
 
-// ---------- rotas: Google Routes API ----------
-function decodePolyline(str) {
-  const out = []; let i = 0, lat = 0, lng = 0;
-  while (i < str.length) {
-    for (const k of [0, 1]) {
-      let shift = 0, res = 0, b;
-      do { b = str.charCodeAt(i++) - 63; res |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
-      const d = res & 1 ? ~(res >> 1) : res >> 1;
-      if (k === 0) lat += d; else lng += d;
-    }
-    out.push([lat / 1e5, lng / 1e5]);
-  }
-  return out;
-}
-const G_ANG = { TURN_SLIGHT_LEFT: -45, TURN_SHARP_LEFT: -135, TURN_LEFT: -90, TURN_SLIGHT_RIGHT: 45, TURN_SHARP_RIGHT: 135, TURN_RIGHT: 90, RAMP_LEFT: -45, RAMP_RIGHT: 45, FORK_LEFT: -45, FORK_RIGHT: 45, MERGE: 0, STRAIGHT: 0, NAME_CHANGE: 0 };
-async function googleRoute(a, b, mode) {
-  const travelMode = { car: 'DRIVE', bike: 'BICYCLE', foot: 'WALK' }[mode];
+// ---------- rotas: OpenRouteService (perfil caminhão, respeita altura/peso/comprimento) ----------
+const ORS_ANG = { 0: -90, 1: 90, 2: -135, 3: 135, 4: -45, 5: 45, 6: 0, 12: -30, 13: 30 };
+async function orsRoute(a, b, v) {
   const body = {
-    origin: { location: { latLng: { latitude: a.lat, longitude: a.lng } } },
-    destination: { location: { latLng: { latitude: b.lat, longitude: b.lng } } },
-    travelMode, computeAlternativeRoutes: true, languageCode: 'pt-BR', units: 'METRIC'
+    coordinates: [[a.lng, a.lat], [b.lng, b.lat]], language: 'pt', units: 'm', instructions: true, preference: 'recommended',
+    options: { vehicle_type: v.ors, profile_params: { restrictions: { height: v.h, width: v.w, length: v.l, weight: v.t, axleload: +(v.t / v.axles).toFixed(1) } } }
   };
-  if (travelMode === 'DRIVE') body.routingPreference = 'TRAFFIC_AWARE';
-  const j = await getJSON('https://routes.googleapis.com/directions/v2:computeRoutes', {
-    method: 'POST', body: JSON.stringify(body),
-    headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': GOOGLE_KEY,
-      'X-Goog-FieldMask': 'routes.distanceMeters,routes.duration,routes.description,routes.polyline.encodedPolyline,routes.legs.steps.distanceMeters,routes.legs.steps.navigationInstruction,routes.legs.steps.startLocation' }
-  }, 20000);
-  if (!j || !j.routes || !j.routes.length) throw new HttpError(404, 'Não existe rota entre esses pontos');
-  return j.routes.slice(0, 3).map(r => {
-    const raw = (r.legs || []).flatMap(l => l.steps || []);
-    const steps = raw.map((s, i) => {
-      const man = (s.navigationInstruction || {}).maneuver || '';
-      const kind = i === 0 ? 'depart' : /ROUNDABOUT/.test(man) ? 'roundabout' : /UTURN/.test(man) ? 'uturn' : 'turn';
-      const ll = s.startLocation.latLng;
-      return { text: (s.navigationInstruction || {}).instructions || 'Continue', name: '', distance: s.distanceMeters || 0, loc: [ll.latitude, ll.longitude], kind, angle: G_ANG[man] ?? 0 };
+  if (v.avoidTolls) body.options.avoid_features = ['tollways'];
+  if (haversine(a, b) < 90000) body.alternative_routes = { target_count: 2, weight_factor: 1.4, share_factor: 0.6 };
+  const call = bd => getJSON('https://api.openrouteservice.org/v2/directions/driving-hgv/geojson', {
+    method: 'POST', body: JSON.stringify(bd), headers: { 'Content-Type': 'application/json', Accept: 'application/geo+json', Authorization: ORS_KEY }
+  }, 25000);
+  let j;
+  try { j = await call(body); }
+  catch (e) {
+    const code = e.body && e.body.error && e.body.error.code;
+    if (code === 2009 || code === 2010) throw new HttpError(404, 'Não há rota para este veículo entre esses pontos (verifique dimensões e peso)');
+    if (body.alternative_routes) { delete body.alternative_routes; j = await call(body); } else throw e;
+  }
+  const routes = (j.features || []).slice(0, 3).map(f => {
+    const coords = f.geometry.coordinates;
+    const steps = f.properties.segments.flatMap(s => s.steps).map(s => {
+      const [x, y] = coords[s.way_points[0]];
+      const name = s.name && s.name !== '-' && !s.instruction.includes(s.name) ? s.name : '';
+      return { text: s.instruction, name, distance: s.distance, loc: [y, x],
+        kind: s.type === 11 ? 'depart' : s.type === 10 ? 'arrive' : (s.type === 7 || s.type === 8) ? 'roundabout' : s.type === 9 ? 'uturn' : 'turn',
+        angle: ORS_ANG[s.type] ?? 0, _road: s.name && s.name !== '-' ? s.name : '' };
     });
-    steps.push({ text: 'Chegada ao destino', name: '', distance: 0, loc: [b.lat, b.lng], kind: 'arrive', angle: 0 });
-    return { distance: r.distanceMeters, duration: parseFloat(r.duration), summary: r.description ? 'via ' + r.description : '',
-      coords: decodePolyline(r.polyline.encodedPolyline).map(([y, x]) => [+y.toFixed(5), +x.toFixed(5)]), steps };
+    const summary = topRoads(steps.map(s => ({ name: s._road, distance: s.distance })));
+    steps.forEach(s => delete s._road);
+    return { distance: f.properties.summary.distance, duration: f.properties.summary.duration, summary,
+      coords: coords.map(([x, y]) => [+y.toFixed(5), +x.toFixed(5)]), steps };
   });
+  if (!routes.length) throw new HttpError(404, 'Não há rota para este veículo entre esses pontos');
+  return { provider: 'ors', truckRules: true, tollsAvoided: v.avoidTolls, routes };
 }
 
-async function route(a, b, mode) {
-  if (PROVIDER === 'google') {
-    try { return { provider: 'google', traffic: mode === 'car', routes: await googleRoute(a, b, mode) }; }
-    catch (e) { if (e.status === 404) throw e; /* cai para OSM */ }
+async function route(a, b, v) {
+  if (ROUTING === 'ors') {
+    try { return await orsRoute(a, b, v); }
+    catch (e) { if (e.status === 404) throw e; console.error('ORS falhou, usando OSRM:', e.message); }
   }
-  return { provider: 'osm', traffic: false, routes: await osrmRoute(a, b, mode) };
+  return osrmRoute(a, b, v);
 }
 
 // ---------- HTTP ----------
@@ -257,7 +292,7 @@ function send(res, status, body, type = 'application/json; charset=utf-8', extra
 }
 
 const routes = {
-  '/api/config': async () => ({ provider: PROVIDER }),
+  '/api/config': async () => ({ geocoder: PROVIDER, routing: ROUTING, vehicles: VEHICLES }),
   '/api/geocode': async q => {
     const text = (q.get('q') || '').trim().slice(0, 200);
     if (text.length < 3) return [];
@@ -274,15 +309,15 @@ const routes = {
   '/api/cep': async q => { const c = String(q.get('cep') || '').replace(/\D/g, ''); return cached(`c|${PROVIDER}|${c}`, 864e5, () => byCEP(c)); },
   '/api/route': async q => {
     const a = parsePt(q.get('from'), 'from'), b = parsePt(q.get('to'), 'to');
-    const mode = OSRM[q.get('mode')] ? q.get('mode') : 'car';
-    const k = `x|${PROVIDER}|${mode}|${a.lat.toFixed(5)},${a.lng.toFixed(5)}|${b.lat.toFixed(5)},${b.lng.toFixed(5)}`;
-    return cached(k, PROVIDER === 'google' && mode === 'car' ? 3e5 : 36e5, () => route(a, b, mode));
+    const v = vehicleFrom(q);
+    const k = `x|${ROUTING}|${v.id}|${v.h}|${v.l}|${v.t}|${v.axles}|${v.avoidTolls}|${a.lat.toFixed(5)},${a.lng.toFixed(5)}|${b.lat.toFixed(5)},${b.lng.toFixed(5)}`;
+    return cached(k, 36e5, () => route(a, b, v));
   }
 };
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
-  if (url.pathname === '/healthz') return send(res, 200, { ok: true, provider: PROVIDER });
+  if (url.pathname === '/healthz') return send(res, 200, { ok: true, geocoder: PROVIDER, routing: ROUTING });
   if (url.pathname.startsWith('/api/')) {
     if (req.method !== 'GET') return send(res, 405, { error: 'Método não permitido' });
     const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
@@ -307,5 +342,5 @@ const server = http.createServer(async (req, res) => {
   });
 });
 
-if (require.main === module) server.listen(PORT, () => console.log(`Roteirizador ouvindo na porta ${PORT} · provedor: ${PROVIDER}`));
-module.exports = { server, decodePolyline, osrmText };
+if (require.main === module) server.listen(PORT, () => console.log(`Roteirizador ouvindo na porta ${PORT} · endereços: ${PROVIDER} · rotas: ${ROUTING}`));
+module.exports = { server, osrmText, adjustedDuration, VEHICLES };
